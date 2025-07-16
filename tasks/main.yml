@@ -6,9 +6,88 @@
       '') }}"
   when: consul_version == "latest"
 
+- name: Debug - Show environment variables related to Python/virtualenv
+  ansible.builtin.debug:
+    msg:
+      - "VIRTUAL_ENV environment variable: {{ ansible_env.VIRTUAL_ENV | default('NOT SET') }}"
+      - "VIRTUALENV environment variable: {{ ansible_env.VIRTUALENV | default('NOT SET') }}"
+      - "PATH environment variable: {{ ansible_env.PATH | default('NOT SET') }}"
+      - "Python executable: {{ ansible_python_interpreter | default('NOT SET') }}"
+  when: consul_install_dependencies | bool
+
+- name: Debug - Show virtualenv lookup and resolution
+  ansible.builtin.debug:
+    msg:
+      - "lookup('env', 'VIRTUAL_ENV') result: '{{ lookup('env', 'VIRTUAL_ENV') }}'"
+      - "lookup('env', 'VIRTUAL_ENV') | default('') result: '{{ lookup('env', 'VIRTUAL_ENV') | default('') }}'"
+      - "virtualenv variable from defaults: '{{ virtualenv }}'"
+      - "ansible_env keys: {{ ansible_env.keys() | list }}"
+  when: consul_install_dependencies | bool
+
+- name: Debug - Alternative virtualenv detection methods
+  ansible.builtin.debug:
+    msg:
+      - "Method 1 - ansible_env.VIRTUAL_ENV: '{{ ansible_env.VIRTUAL_ENV | default('') }}'"
+      - "Method 2 - lookup env VIRTUAL_ENV: '{{ lookup('env', 'VIRTUAL_ENV') | default('') }}'"
+      - "Method 3 - Check if python is in venv: {{ ansible_python_interpreter | default('python') | regex_search('venv|virtualenv|\\.venv') is not none }}"
+      - "Method 4 - Check sys.prefix vs sys.base_prefix (via shell): checking..."
+  when: consul_install_dependencies | bool
+
+- name: Check if we're in a virtual environment using Python
+  ansible.builtin.shell: |
+    {{ ansible_python_interpreter | default('python') }} -c "
+    import sys
+    in_venv = hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)
+    print('true' if in_venv else 'false')
+    print('sys.prefix:', sys.prefix)
+    print('sys.base_prefix:', getattr(sys, 'base_prefix', 'not available'))
+    print('sys.real_prefix:', getattr(sys, 'real_prefix', 'not available'))
+    "
+  register: python_venv_check
+  delegate_to: 127.0.0.1
+  become: false
+  run_once: true
+  when: consul_install_dependencies | bool
+
+- name: Debug - Python virtual environment check results
+  ansible.builtin.debug:
+    msg:
+      - "Python venv check output: {{ python_venv_check.stdout_lines }}"
+      - "Is in virtual environment: {{ python_venv_check.stdout_lines[0] == 'true' }}"
+  when: consul_install_dependencies | bool
+
+- name: Check for pip executables in virtualenv
+  ansible.builtin.shell: |
+    for pip_cmd in pip pip3 python3 python; do
+      if [ -x "{{ virtualenv }}/bin/$pip_cmd" ]; then
+        echo "Found: $pip_cmd at {{ virtualenv }}/bin/$pip_cmd"
+      fi
+    done
+    echo "--- Contents of {{ virtualenv }}/bin ---"
+    ls -la "{{ virtualenv }}/bin/" | grep -E "(pip|python)" || echo "No pip or python found"
+  register: virtualenv_pip_check
+  delegate_to: 127.0.0.1
+  become: false
+  run_once: true
+  when: consul_install_dependencies | bool and virtualenv != ""
+
+- name: Debug - Virtualenv pip check results
+  ansible.builtin.debug:
+    msg:
+      - "Virtualenv pip check output:"
+      - "{{ virtualenv_pip_check.stdout_lines }}"
+  when: consul_install_dependencies | bool and virtualenv != ""
+
 - name: Install python dependencies
   when: consul_install_dependencies | bool
   block:
+    - name: Debug - Show which pip installation method will be used
+      ansible.builtin.debug:
+        msg:
+          - "Will use --user installation: {{ virtualenv == '' }}"
+          - "Will use virtualenv installation: {{ virtualenv != '' }}"
+          - "virtualenv value for condition check: '{{ virtualenv | default('') }}'"
+
     - name: Install netaddr dependency on controlling host (with --user)
       ansible.builtin.pip:
         name: netaddr
@@ -20,7 +99,7 @@
       run_once: true
       when: virtualenv == ""
 
-    - name: Install netaddr dependency on controlling host (virtualenv)
+    - name: Install netaddr dependency on controlling host (virtualenv - standard pip)
       ansible.builtin.pip:
         name: netaddr
         virtualenv: "{{ virtualenv }}"
@@ -30,6 +109,133 @@
         ansible_become: false
       run_once: true
       when: virtualenv != ""
+      ignore_errors: true
+      register: virtualenv_pip_install
+
+    - name: Install netaddr dependency using python -m pip (fallback for mise)
+      ansible.builtin.shell: |
+        "{{ virtualenv }}/bin/python" -m pip install netaddr
+      delegate_to: 127.0.0.1
+      become: false
+      run_once: true
+      when:
+        - virtualenv != ""
+        - virtualenv_pip_install is failed
+      register: python_module_pip_install
+      ignore_errors: true
+
+    - name: Install netaddr dependency using current Python interpreter (fallback)
+      ansible.builtin.shell: |
+        {{ ansible_python_interpreter | default('python') }} -m pip install netaddr
+      delegate_to: 127.0.0.1
+      become: false
+      run_once: true
+      when:
+        - virtualenv != ""
+        - virtualenv_pip_install is failed
+        - python_module_pip_install is failed
+      register: current_python_pip_install
+      ignore_errors: true
+
+    - name: Try to find mise python pip executable
+      ansible.builtin.shell: |
+        # Try to find pip in mise python installation
+        if command -v mise >/dev/null 2>&1; then
+          MISE_PYTHON_PATH=$(mise which python 2>/dev/null || echo "")
+          if [ -n "$MISE_PYTHON_PATH" ]; then
+            MISE_PIP_PATH="${MISE_PYTHON_PATH%/python}/pip"
+            if [ -x "$MISE_PIP_PATH" ]; then
+              echo "found:$MISE_PIP_PATH"
+              exit 0
+            fi
+          fi
+        fi
+        # Fallback: try common mise paths
+        for python_dir in ~/.local/share/mise/installs/python/*/bin; do
+          if [ -x "$python_dir/pip" ]; then
+            echo "found:$python_dir/pip"
+            exit 0
+          fi
+        done
+        echo "not_found"
+      delegate_to: 127.0.0.1
+      become: false
+      run_once: true
+      register: mise_pip_search
+      when:
+        - virtualenv != ""
+        - virtualenv_pip_install is failed
+        - python_module_pip_install is failed
+        - current_python_pip_install is failed
+
+    - name: Install netaddr using mise python pip (mise-specific fix)
+      ansible.builtin.shell: |
+        {{ mise_pip_search.stdout.split(':')[1] }} install netaddr
+      delegate_to: 127.0.0.1
+      become: false
+      run_once: true
+      when:
+        - virtualenv != ""
+        - virtualenv_pip_install is failed
+        - python_module_pip_install is failed
+        - current_python_pip_install is failed
+        - mise_pip_search.stdout.startswith('found:')
+      register: mise_pip_install
+      ignore_errors: true
+
+    - name: Install pip in mise virtual environment (ensurepip fallback)
+      ansible.builtin.shell: |
+        "{{ virtualenv }}/bin/python" -m ensurepip --upgrade
+      delegate_to: 127.0.0.1
+      become: false
+      run_once: true
+      when:
+        - virtualenv != ""
+        - virtualenv_pip_install is failed
+        - python_module_pip_install is failed
+        - current_python_pip_install is failed
+        - (mise_pip_search is not defined or not mise_pip_search.stdout.startswith('found:') or mise_pip_install is failed)
+      register: ensurepip_install
+      ignore_errors: true
+
+    - name: Install netaddr using newly installed pip (post-ensurepip)
+      ansible.builtin.shell: |
+        "{{ virtualenv }}/bin/python" -m pip install netaddr
+      delegate_to: 127.0.0.1
+      become: false
+      run_once: true
+      when:
+        - virtualenv != ""
+        - virtualenv_pip_install is failed
+        - python_module_pip_install is failed
+        - current_python_pip_install is failed
+        - (mise_pip_search is not defined or not mise_pip_search.stdout.startswith('found:') or mise_pip_install is failed)
+        - ensurepip_install is defined and not ensurepip_install.failed
+      register: post_ensurepip_install
+
+    - name: Debug - Final installation status
+      ansible.builtin.debug:
+        msg:
+          - "Standard virtualenv pip install result: {{ 'success' if virtualenv_pip_install is defined and virtualenv_pip_install.rc is defined and virtualenv_pip_install.rc == 0 else 'failed' }}"
+          - "Python module pip install result: {{ 'success' if python_module_pip_install is defined and python_module_pip_install.rc is defined and python_module_pip_install.rc == 0 else 'not attempted or failed' }}"
+          - "Current Python pip install result: {{ 'success' if current_python_pip_install is defined and current_python_pip_install.rc is defined and current_python_pip_install.rc == 0 else 'not attempted or failed' }}"
+          - "Mise pip search result: {{ mise_pip_search.stdout if mise_pip_search is defined else 'not attempted' }}"
+          - "Mise pip install result: {{ 'success' if mise_pip_install is defined and mise_pip_install.rc is defined and mise_pip_install.rc == 0 else 'not attempted or failed' }}"
+          - "Ensurepip install result: {{ 'success' if ensurepip_install is defined and ensurepip_install.rc is defined and ensurepip_install.rc == 0 else 'not attempted or failed' }}"
+          - "Post-ensurepip netaddr install result: {{ 'success' if post_ensurepip_install is defined and post_ensurepip_install.rc is defined and post_ensurepip_install.rc == 0 else 'not attempted or failed' }}"
+      when: virtualenv != ""
+
+    - name: Fail if all netaddr installation methods failed
+      ansible.builtin.fail:
+        msg: "Failed to install netaddr dependency using any available method. Tried: standard pip module, python -m pip from venv, current python interpreter, mise python pip, and ensurepip. Check that Python and pip are properly configured in your mise environment."
+      when:
+        - virtualenv != ""
+        - virtualenv_pip_install is defined and virtualenv_pip_install.failed | default(true)
+        - python_module_pip_install is defined and python_module_pip_install.rc != 0
+        - current_python_pip_install is defined and current_python_pip_install.rc != 0
+        - not (mise_pip_install is defined and mise_pip_install.rc is defined and mise_pip_install.rc == 0)
+        - not (ensurepip_install is defined and ensurepip_install.rc is defined and ensurepip_install.rc == 0)
+        - not (post_ensurepip_install is defined and post_ensurepip_install.rc is defined and post_ensurepip_install.rc == 0)
 
 - name: Include checks/asserts
   ansible.builtin.import_tasks:
