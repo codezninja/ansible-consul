@@ -43,7 +43,16 @@
     managed_files: "{{ managed_files | default([]) }} + [ '{{ consul_configd_path }}/50custom.json' ]"
 
 # All configuration files must be given to the validate command at once (partial conf might raise some issue regarding missing some required items), so it's not possible to use the validate arg og the ansibvle.builtin.copy module used to template the config
-- name: Validate configuration
+# Install ACL package to support Ansible 2.18.6 ACL syntax on Linux systems
+# See: https://github.com/ansible/ansible/issues/85503
+- name: Install ACL package for privilege escalation compatibility
+  ansible.builtin.package:
+    name: acl
+    state: present
+  become: true
+  when: ansible_os_family in ['Debian', 'RedHat', 'Archlinux']
+
+- name: Validate configuration (with become_user and ACL support)
   become: true
   become_user: "{{ consul_user }}"
   ansible.builtin.command: >
