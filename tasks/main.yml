@@ -219,7 +219,7 @@
           - "Standard virtualenv pip install result: {{ 'success' if virtualenv_pip_install is defined and virtualenv_pip_install.rc is defined and virtualenv_pip_install.rc == 0 else 'failed' }}"
           - "Python module pip install result: {{ 'success' if python_module_pip_install is defined and python_module_pip_install.rc is defined and python_module_pip_install.rc == 0 else 'not attempted or failed' }}"
           - "Current Python pip install result: {{ 'success' if current_python_pip_install is defined and current_python_pip_install.rc is defined and current_python_pip_install.rc == 0 else 'not attempted or failed' }}"
-          - "Mise pip search result: {{ mise_pip_search.stdout if mise_pip_search is defined else 'not attempted' }}"
+          - "Mise pip search result: {{ mise_pip_search.stdout | default('not attempted') if mise_pip_search is defined else 'not attempted' }}"
           - "Mise pip install result: {{ 'success' if mise_pip_install is defined and mise_pip_install.rc is defined and mise_pip_install.rc == 0 else 'not attempted or failed' }}"
           - "Ensurepip install result: {{ 'success' if ensurepip_install is defined and ensurepip_install.rc is defined and ensurepip_install.rc == 0 else 'not attempted or failed' }}"
           - "Post-ensurepip netaddr install result: {{ 'success' if post_ensurepip_install is defined and post_ensurepip_install.rc is defined and post_ensurepip_install.rc == 0 else 'not attempted or failed' }}"
